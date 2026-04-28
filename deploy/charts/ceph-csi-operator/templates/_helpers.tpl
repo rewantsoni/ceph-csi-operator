@@ -60,3 +60,29 @@ Create the name of the service account to use
 {{- default "default" .Values.serviceAccount.name }}
 {{- end }}
 {{- end }}
+
+{{/*
+Namespace for generated references.
+Always uses the Helm release namespace.
+*/}}
+{{- define "ceph-csi-operator.namespaceName" -}}
+{{- .Release.Namespace }}
+{{- end }}
+
+{{/*
+Resource name with proper truncation for Kubernetes 63-character limit.
+Takes a dict with:
+  - .suffix: Resource name suffix (e.g., "metrics", "webhook")
+  - .context: Template context (root context with .Values, .Release, etc.)
+Dynamically calculates safe truncation to ensure total name length <= 63 chars.
+*/}}
+{{- define "ceph-csi-operator.resourceName" -}}
+{{- $fullname := include "ceph-csi-operator.fullname" .context }}
+{{- $suffix := .suffix }}
+{{- $maxLen := sub 62 (len $suffix) | int }}
+{{- if gt (len $fullname) $maxLen }}
+{{- printf "%s-%s" (trunc $maxLen $fullname | trimSuffix "-") $suffix | trunc 63 | trimSuffix "-" }}
+{{- else }}
+{{- printf "%s-%s" $fullname $suffix | trunc 63 | trimSuffix "-" }}
+{{- end }}
+{{- end }}

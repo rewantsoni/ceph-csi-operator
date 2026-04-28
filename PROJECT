@@ -5,6 +5,10 @@
 domain: ceph.io
 layout:
 - go.kubebuilder.io/v4
+plugins:
+  helm.kubebuilder.io/v2-alpha:
+    manifests: deploy/all-in-one/install.yaml
+    output: deploy/charts
 projectName: ceph-csi-operator
 repo: github.com/ceph/ceph-csi-operator
 resources:

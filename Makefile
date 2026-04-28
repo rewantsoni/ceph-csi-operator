@@ -198,22 +198,9 @@ build-installer: manifests generate kustomize ## Generate a consolidated YAML wi
 	$(KUSTOMIZE) build build > deploy/all-in-one/install.yaml
 	rm -rf build
 
-.PHONY: build-helm-installer
-build-helm-installer: manifests generate kustomize helmify ## Generate helm charts for the operator.
-	mkdir -p build deploy
-	@# Preserve the manually maintained values.yaml (contains helm-docs comments)
-	@if [ -f deploy/charts/ceph-csi-operator/values.yaml ]; then \
-		cp deploy/charts/ceph-csi-operator/values.yaml deploy/charts/ceph-csi-operator/values.yaml.bak; \
-	fi
-	cd build && echo "$$BUILD_INSTALLER_OVERLAY" > kustomization.yaml
-	cd build && $(KUSTOMIZE) edit add resource ../config/default/
-	$(KUSTOMIZE) build build | $(HELMIFY) -preserve-ns -image-pull-secrets deploy/charts/ceph-csi-operator
-	hack/patch-csi-operator-helm-chart.sh deploy/charts/ceph-csi-operator
-	@# Restore the manually maintained values.yaml
-	@if [ -f deploy/charts/ceph-csi-operator/values.yaml.bak ]; then \
-		mv deploy/charts/ceph-csi-operator/values.yaml.bak deploy/charts/ceph-csi-operator/values.yaml; \
-	fi
-	rm -rf build
+.PHONY: build-helm-chart
+build-helm-chart: build-installer ## Generate helm chart using kubebuilder helm/v2-alpha plugin.
+	kubebuilder edit --plugins=helm/v2-alpha --manifests=deploy/all-in-one/install.yaml --output-dir=deploy/charts
 
 .PHONY: build-multifile-installer
 build-multifile-installer: build-csi-rbac manifests generate kustomize
@@ -230,26 +217,6 @@ build-csi-rbac:
 	cd build && echo "$$BUILD_CSI_RBAC_OVERLAY" > kustomization.yaml
 	$(KUSTOMIZE) build build > deploy/multifile/csi-rbac.yaml
 	rm -rf build
-
-.PHONY: verify-helm-values
-verify-helm-values: manifests generate kustomize helmify ## Verify operator values.yaml is in sync with generated output.
-	@mkdir -p build
-	@cd build && echo "$$BUILD_INSTALLER_OVERLAY" > kustomization.yaml
-	@cd build && $(KUSTOMIZE) edit add resource ../config/default/
-	@mkdir -p build/tmp-chart
-	@$(KUSTOMIZE) build build | $(HELMIFY) -preserve-ns -image-pull-secrets build/tmp-chart > /dev/null 2>&1
-	@# Compare values by stripping comments from the maintained file
-	@grep -v '^[[:space:]]*#' deploy/charts/ceph-csi-operator/values.yaml | grep -v '^[[:space:]]*$$' > build/maintained-values-stripped.yaml
-	@grep -v '^[[:space:]]*#' build/tmp-chart/values.yaml | grep -v '^[[:space:]]*$$' > build/generated-values-stripped.yaml
-	@if ! diff -q build/maintained-values-stripped.yaml build/generated-values-stripped.yaml > /dev/null 2>&1; then \
-		echo "ERROR: deploy/charts/ceph-csi-operator/values.yaml is out of sync with generated output."; \
-		echo "Diff (maintained vs generated):"; \
-		diff -u build/maintained-values-stripped.yaml build/generated-values-stripped.yaml || true; \
-		rm -rf build; \
-		exit 1; \
-	fi
-	@echo "deploy/charts/ceph-csi-operator/values.yaml is in sync."
-	@rm -rf build
 
 ##@ Docs
 .PHONY: generate-helm-docs
@@ -302,7 +269,6 @@ KUSTOMIZE ?= $(LOCALBIN)/kustomize-$(KUSTOMIZE_VERSION)
 CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen-$(CONTROLLER_TOOLS_VERSION)
 ENVTEST ?= $(LOCALBIN)/setup-envtest-$(ENVTEST_VERSION)
 GOLANGCI_LINT = $(LOCALBIN)/golangci-lint-$(GOLANGCI_LINT_VERSION)
-HELMIFY ?= $(LOCALBIN)/helmify-$(HELMIFY_VERSION)
 HELM_DOCS ?= $(LOCALBIN)/helm-docs-$(HELM_DOCS_VERSION)
 
 ## Tool Versions
@@ -310,18 +276,12 @@ KUSTOMIZE_VERSION ?= v5.3.0
 CONTROLLER_TOOLS_VERSION ?= v0.17.2
 ENVTEST_VERSION ?= v0.0.0-20250517180713-32e5e9e948a5
 GOLANGCI_LINT_VERSION ?= v1.63.4
-HELMIFY_VERSION ?= v0.4.18
 HELM_DOCS_VERSION ?= v1.14.2
 
 .PHONY: helm-docs
 helm-docs: $(HELM_DOCS) ## Download helm-docs locally if necessary.
 $(HELM_DOCS): $(LOCALBIN)
 	$(call go-install-tool,$(HELM_DOCS),github.com/norwoodj/helm-docs/cmd/helm-docs,$(HELM_DOCS_VERSION))
-
-.PHONY: helmify
-helmify: $(HELMIFY) ## Download helmify locally if necessary.
-$(HELMIFY): $(LOCALBIN)
-	$(call go-install-tool,$(HELMIFY),github.com/arttor/helmify/cmd/helmify,$(HELMIFY_VERSION))
 
 .PHONY: kustomize
 kustomize: $(KUSTOMIZE) ## Download kustomize locally if necessary.
@@ -361,3 +321,50 @@ GOBIN=$(LOCALBIN) go install $${package} ;\
 mv "$$(echo "$(1)" | sed "s/-$(3)$$//")" $(1) ;\
 }
 endef
+
+##@ Helm Deployment
+
+## Helm binary to use for deploying the chart
+HELM ?= helm
+## Namespace to deploy the Helm release
+HELM_NAMESPACE ?= ceph-csi-operator-system
+## Name of the Helm release
+HELM_RELEASE ?= ceph-csi-operator
+## Path to the Helm chart directory
+HELM_CHART_DIR ?= deploy/charts/ceph-csi-operator
+## Additional arguments to pass to helm commands
+HELM_EXTRA_ARGS ?=
+
+.PHONY: install-helm
+install-helm: ## Install the latest version of Helm.
+	@command -v $(HELM) >/dev/null 2>&1 || { \
+		echo "Installing Helm..." && \
+		curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-4 | bash; \
+	}
+
+.PHONY: helm-deploy
+helm-deploy: install-helm ## Deploy manager to the K8s cluster via Helm. Specify an image with IMG.
+	$(HELM) upgrade --install $(HELM_RELEASE) $(HELM_CHART_DIR) \
+		--namespace $(HELM_NAMESPACE) \
+		--create-namespace \
+		--set manager.image.repository=$${IMG%:*} \
+		--set manager.image.tag=$${IMG##*:} \
+		--wait \
+		--timeout 5m \
+		$(HELM_EXTRA_ARGS)
+
+.PHONY: helm-uninstall
+helm-uninstall: ## Uninstall the Helm release from the K8s cluster.
+	$(HELM) uninstall $(HELM_RELEASE) --namespace $(HELM_NAMESPACE)
+
+.PHONY: helm-status
+helm-status: ## Show Helm release status.
+	$(HELM) status $(HELM_RELEASE) --namespace $(HELM_NAMESPACE)
+
+.PHONY: helm-history
+helm-history: ## Show Helm release history.
+	$(HELM) history $(HELM_RELEASE) --namespace $(HELM_NAMESPACE)
+
+.PHONY: helm-rollback
+helm-rollback: ## Rollback to previous Helm release.
+	$(HELM) rollback $(HELM_RELEASE) --namespace $(HELM_NAMESPACE)
